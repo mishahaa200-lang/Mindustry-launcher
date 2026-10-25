@@ -8,7 +8,9 @@
 
 Нужны Python 3.8+ (tkinter входит в поставку) и Java 17+. Сторонних библиотек нет.
 """
+import base64
 import configparser
+import io
 import json
 import os
 import platform
@@ -20,13 +22,23 @@ import subprocess
 import sys
 import threading
 import time
+import tarfile
 import traceback
+import urllib.parse
 import urllib.request
+import webbrowser
+import zipfile
 import tkinter as tk
 from tkinter import filedialog
 from tkinter import font as tkfont
 
-APP_VER = "1.0"
+try:  # необязательно: нужен Pillow, чтобы показывать JPEG-превью мастерской
+    from PIL import Image, ImageTk
+    HAVE_PIL = True
+except Exception:
+    HAVE_PIL = False
+
+APP_VER = "1.1"
 API_URL = "https://api.github.com/repos/Anuken/Mindustry/releases?per_page=100&page={page}"
 JAR_NAMES = ("Mindustry.jar", "desktop-release.jar")
 UA = {"User-Agent": "MindustryLauncher/" + APP_VER}
@@ -37,6 +49,7 @@ NOWIN = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW
 CONF_DIR = os.path.join(os.path.expanduser("~"), ".mindustry-launcher")
 SETTINGS_FILE = os.path.join(CONF_DIR, "settings.ini")
 CACHE_FILE = os.path.join(CONF_DIR, "releases_cache.json")
+GLOBAL_STATS = os.path.join(CONF_DIR, "stats.json")  # общее время игры и число запусков
 
 THEMES = {
     "AMBER":    dict(bg="#0b0905", panel="#120e06", fg="#ffc21a", dim="#8a6a14", acc="#ff3b2f"),
@@ -46,14 +59,26 @@ THEMES = {
     "MONO":     dict(bg="#0a0a0a", panel="#111111", fg="#e6e6e6", dim="#777777", acc="#ffffff"),
 }
 
-NAV = [("containers", "CONTAINERS.RSU"), ("versions", "VERSIONS.DAT"), ("settings", "SETTINGS.INI")]
+NAV = [("containers", "CONTAINERS.RSU"), ("versions", "VERSIONS.DAT"),
+       ("workshop", "WORKSHOP.SYS"), ("saves", "SAVES.BAK"),
+       ("monitor", "MONITOR.SYS"), ("settings", "SETTINGS.INI")]
 
-SECTIONS = {"install_dir": "launcher", "theme": "launcher", "show_pre": "launcher",
+APP_ID = 1127400  # Mindustry в Steam
+STEAMCMD = {
+    "Windows": ("https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip", "steamcmd.exe"),
+    "Linux": ("https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz", "steamcmd.sh"),
+    "Darwin": ("https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz", "steamcmd.sh"),
+}
+MOD_MARKERS = ("mod.json", "mod.hjson", "plugin.json", "plugin.hjson")
+
+SECTIONS = {"install_dir": "launcher", "theme": "launcher", "show_pre": "launcher", "ws_sort": "launcher",
             "java_path": "java", "ram_min": "java", "ram_max": "java",
-            "jvm_args": "java", "game_args": "java"}
-DEFAULTS = {"install_dir": CONF_DIR, "theme": "AMBER", "show_pre": "0",
+            "jvm_args": "java", "game_args": "java", "steam_user": "steam",
+            "auto_backup": "backup", "backup_keep": "backup"}
+DEFAULTS = {"install_dir": CONF_DIR, "theme": "AMBER", "show_pre": "0", "ws_sort": "name_asc",
             "java_path": "", "ram_min": "256M", "ram_max": "2G",
-            "jvm_args": "", "game_args": ""}
+            "jvm_args": "", "game_args": "", "steam_user": "",
+            "auto_backup": "1", "backup_keep": "10"}
 CKEYS = ("version", "ram_min", "ram_max", "jvm_args", "game_args", "icon")
 
 
@@ -71,6 +96,12 @@ class Settings:
             pass
         if self.d["theme"] not in THEMES:
             self.d["theme"] = "AMBER"
+        if self.d["ws_sort"] not in ("name_asc", "name_desc", "type"):
+            self.d["ws_sort"] = "name_asc"
+        if self.d["auto_backup"] not in ("0", "1"):
+            self.d["auto_backup"] = "1"
+        if self.d["backup_keep"] not in ("5", "10", "20", "50"):
+            self.d["backup_keep"] = "10"
 
     def get(self, k):
         return self.d[k]
@@ -142,7 +173,36 @@ def split_args(s):
 
 
 def fmt_size(n):
+    if 0 < n < 1024 * 1024:
+        return f"{max(n / 1024, 0.1):.0f}KB"
     return f"{n / 1024 / 1024:.1f}MB" if n else "?"
+
+
+def fmt_dur(sec):
+    m = int(sec // 60)
+    if m < 1:
+        return "0m" if sec < 1 else "<1m"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+def container_stats(root, name):
+    """-> (секунд наиграно, число запусков) для контейнера."""
+    d = load_json(os.path.join(root, "containers", name, "stats.json"), {})
+    return float(d.get("seconds", 0) or 0), int(d.get("launches", 0) or 0)
+
+
+def add_playtime(root, name, secs=0.0, launches=0):
+    """Добавляет время/запуски в статистику контейнера и в общий счётчик."""
+    if secs <= 0 and not launches:
+        return
+    for path in (os.path.join(root, "containers", name, "stats.json"), GLOBAL_STATS):
+        if path != GLOBAL_STATS and not os.path.isdir(os.path.dirname(path)):
+            continue
+        d = load_json(path, {})
+        d["seconds"] = float(d.get("seconds", 0) or 0) + max(0.0, secs)
+        d["launches"] = int(d.get("launches", 0) or 0) + launches
+        save_json(path, d)
 
 
 def safe_tag(tag):
@@ -277,6 +337,479 @@ def fetch_releases(max_pages=3):
         if len(data) < 100:
             break
     return result
+
+
+def safe_file(s):
+    return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", s or "").strip(" .")[:60]
+
+
+def parse_workshop_ids(text):
+    """Из строки со ссылками и/или числами достаёт ID элементов мастерской."""
+    ids = []
+    for tok in re.split(r"[\s,;]+", (text or "").strip()):
+        m = (re.search(r"[?&]id=(\d+)", tok) or re.search(r"/filedetails/(\d+)", tok)
+             or re.fullmatch(r"(\d{5,})", tok))
+        if m and m.group(1) not in ids:
+            ids.append(m.group(1))
+    return ids
+
+
+def workshop_details(wid):
+    """Публичный API Steam (ключ не нужен). -> {'title','app'} или None."""
+    body = urllib.parse.urlencode({"itemcount": 1, "publishedfileids[0]": wid}).encode()
+    req = urllib.request.Request(
+        "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+        data=body, headers=UA)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        j = json.loads(r.read().decode("utf-8"))
+    d = j["response"]["publishedfiledetails"][0]
+    if d.get("result") != 1:
+        return None
+    return {"title": d.get("title") or "",
+            "app": int(d.get("consumer_app_id") or d.get("creator_app_id") or 0),
+            "visibility": int(d.get("visibility") or 0), "banned": bool(d.get("banned"))}
+
+
+BROWSE_SORTS = {  # название -> (browsesort, доп. параметры)
+    "TRENDING": ("trend", "&days=7"),
+    "NEWEST": ("mostrecent", ""),
+    "POPULAR": ("totaluniquesubscribers", "&days=-1"),
+    "UPDATED": ("lastupdated", ""),
+}
+
+
+def fmt_num(n):
+    return f"{n / 1_000_000:.1f}M" if n >= 1_000_000 else f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def clean_bbcode(text):
+    text = re.sub(r"\[/?[A-Za-z0-9*]+(?:=[^\]]*)?\]", "", text or "")
+    return re.sub(r"\n{3,}", "\n\n", text).strip()[:700]
+
+
+def fetch_bytes(url, timeout=20, limit=6_000_000):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+        return r.read(limit)
+
+
+def workshop_search(query, sort, page):
+    """Страница обзора мастерской Mindustry -> список ID (в порядке выдачи)."""
+    key, extra = BROWSE_SORTS[sort]
+    url = ("https://steamcommunity.com/workshop/browse/?appid=%d&section=readytouseitems"
+           "&numperpage=30&p=%d&browsesort=%s&actualsort=%s%s&searchtext=%s"
+           % (APP_ID, page, key, key, extra, urllib.parse.quote(query)))
+    req = urllib.request.Request(url, headers=dict(UA, **{"Accept-Language": "en"}))
+    with urllib.request.urlopen(req, timeout=25) as r:
+        html = r.read().decode("utf-8", "replace")
+    ids = []
+    for m in re.finditer(r"sharedfiles/filedetails/\?id=(\d+)", html):
+        if m.group(1) not in ids:
+            ids.append(m.group(1))
+    return ids[:30]
+
+
+def workshop_details_many(ids):
+    """Один запрос к публичному API Steam на все ID. -> {id: данные}"""
+    fields = {"itemcount": len(ids)}
+    for i, w in enumerate(ids):
+        fields[f"publishedfileids[{i}]"] = w
+    req = urllib.request.Request(
+        "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+        data=urllib.parse.urlencode(fields).encode(), headers=UA)
+    with urllib.request.urlopen(req, timeout=25) as r:
+        j = json.loads(r.read().decode("utf-8"))
+    res = {}
+    for d in j["response"]["publishedfiledetails"]:
+        if d.get("result") != 1:
+            continue
+        res[str(d.get("publishedfileid"))] = {
+            "title": d.get("title") or "?",
+            "app": int(d.get("consumer_app_id") or d.get("creator_app_id") or 0),
+            "desc": clean_bbcode(d.get("description", "")),
+            "preview": d.get("preview_url", ""),
+            "tags": [t.get("tag", "") for t in d.get("tags", []) if t.get("tag")],
+            "subs": int(d.get("subscriptions") or 0),
+            "size": int(d.get("file_size") or 0),
+            "updated": int(d.get("time_updated") or 0),
+        }
+    return res
+
+
+def fetch_preview(url):
+    """Превью предмета; сначала просим у Steam уменьшенную копию."""
+    if not url:
+        return b""
+    small = url + ("&" if "?" in url else "?") + "imw=256&imh=256&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false"
+    try:
+        return fetch_bytes(small)
+    except Exception:
+        return fetch_bytes(url)
+
+
+def run_steamcmd(exe, args, log):
+    """Запускает steamcmd, пишет важные строки в log, возвращает строки с ошибками."""
+    kw = dict(cwd=os.path.dirname(exe), stdin=subprocess.DEVNULL,
+              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if IS_WIN:
+        kw["creationflags"] = NOWIN
+    p = subprocess.Popen([exe] + args, **kw)
+    errors, updating, last = [], False, 0.0
+    for raw in iter(p.stdout.readline, b""):
+        line = raw.decode("utf-8", "replace").strip()
+        if not line:
+            continue
+        if re.match(r"^\[\s*\d+%\]", line):
+            if not updating:
+                updating = True
+                log("[steamcmd] UPDATING ITSELF (FIRST RUN TAKES A FEW MINUTES) ...", "game")
+            continue
+        if line.startswith("Update state"):
+            if time.time() - last < 3:
+                continue
+            last = time.time()
+        if "ERROR" in line.upper() or "failed" in line.lower():
+            errors.append(line)
+        log("[steamcmd] " + line, "game")
+    p.wait()
+    return errors
+
+
+def steam_dir(root):
+    """SteamCMD падает с 'incompatible path', если в пути есть не-ASCII символы
+    (например, русское имя пользователя). Тогда используем безопасную папку."""
+    p = os.path.join(root, "steamcmd")
+    if p.isascii():
+        return p
+    if IS_WIN:
+        base = os.environ.get("ProgramData") or "C:\\ProgramData"
+        alt = os.path.join(base, "MindustryLauncher", "steamcmd")
+        return alt if alt.isascii() else os.path.join("C:\\", "MindustryLauncher", "steamcmd")
+    return os.path.join(os.sep, "tmp", "mindustry-launcher", "steamcmd")
+
+
+def ensure_steamcmd(dirpath, log):
+    url, exe_name = STEAMCMD.get(platform.system(), (None, None))
+    if not url:
+        raise RuntimeError("UNSUPPORTED OS")
+    exe = os.path.join(dirpath, exe_name)
+    if os.path.isfile(exe):
+        return exe
+    os.makedirs(dirpath, exist_ok=True)
+    log("DOWNLOADING STEAMCMD (OFFICIAL VALVE TOOL) ...")
+    pkg = os.path.join(dirpath, "steamcmd.pkg")
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r, \
+            open(pkg, "wb") as f:
+        shutil.copyfileobj(r, f)
+    if url.endswith(".zip"):
+        with zipfile.ZipFile(pkg) as z:
+            z.extractall(dirpath)
+    else:
+        with tarfile.open(pkg) as tf:
+            tf.extractall(dirpath)
+    os.remove(pkg)
+    if not os.path.isfile(exe):
+        raise RuntimeError("steamcmd NOT FOUND IN ARCHIVE")
+    if not IS_WIN:
+        os.chmod(exe, 0o755)
+    log("STEAMCMD INSTALLED. FIRST START (SELF-UPDATE) ...")
+    run_steamcmd(exe, ["+quit"], log)
+    return exe
+
+
+def install_workshop_item(src, data, title, wid):
+    """Раскладывает скачанный элемент по папкам данных Mindustry.
+    -> (тип, [пути относительно data])"""
+    base = safe_file(title) or f"item_{wid}"
+    found = [(dp, fn) for dp, _, fns in os.walk(src) for fn in fns]
+    mod_dp = next((dp for dp, fn in found if fn.lower() in MOD_MARKERS), None)
+    out, kinds = [], []
+    if mod_dp is not None:
+        shutil.copytree(mod_dp, os.path.join(data, "mods", base), dirs_exist_ok=True)
+        out.append(os.path.join("mods", base))
+        kinds.append("mod")
+    else:
+        files = [(dp, fn) for dp, fn in found if fn.lower().endswith((".msav", ".msch", ".zip", ".jar"))]
+        for i, (dp, fn) in enumerate(files):
+            ext = os.path.splitext(fn)[1].lower()
+            sub, kind = {".msav": ("maps", "map"), ".msch": ("schematics", "schematic")}.get(ext, ("mods", "mod"))
+            name = base + ext if len(files) == 1 else f"{base}_{i + 1}{ext}"
+            os.makedirs(os.path.join(data, sub), exist_ok=True)
+            shutil.copy2(os.path.join(dp, fn), os.path.join(data, sub, name))
+            out.append(os.path.join(sub, name))
+            kinds.append(kind)
+    if not out:
+        raise RuntimeError("UNKNOWN CONTENT: " + ", ".join(fn for _, fn in found[:5]))
+    return "+".join(sorted(set(kinds))), out
+
+
+def unique_path(path):
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    i = 2
+    while os.path.exists(f"{base} ({i}){ext}"):
+        i += 1
+    return f"{base} ({i}){ext}"
+
+
+def import_local_item(path, data):
+    """Кладёт скачанный вручную файл (.msav/.msch/.zip/.jar) или папку мода в папки данных
+    Mindustry. -> (название, тип, [пути относительно data])"""
+    path = path.rstrip("\\/")
+    name = os.path.basename(path)
+    if os.path.isdir(path):
+        mod_dp = next((dp for dp, _, fns in os.walk(path)
+                       if any(fn.lower() in MOD_MARKERS for fn in fns)), None)
+        if mod_dp is None:
+            raise RuntimeError("FOLDER HAS NO mod.json / mod.hjson")
+        dst = unique_path(os.path.join(data, "mods", safe_file(name) or "mod"))
+        shutil.copytree(mod_dp, dst)
+        return name, "mod", [os.path.relpath(dst, data)]
+    ext = os.path.splitext(name)[1].lower()
+    sub, kind = {".msav": ("maps", "map"), ".msch": ("schematics", "schematic"),
+                 ".zip": ("mods", "mod"), ".jar": ("mods", "mod")}.get(ext, (None, None))
+    if not sub:
+        raise RuntimeError(f"UNSUPPORTED FILE TYPE '{ext}' (USE .msav .msch .zip .jar)")
+    if ext == ".zip" and not zipfile.is_zipfile(path):
+        raise RuntimeError("NOT A VALID ZIP FILE")
+    os.makedirs(os.path.join(data, sub), exist_ok=True)
+    dst = unique_path(os.path.join(data, sub, (safe_file(os.path.splitext(name)[0]) or "item") + ext))
+    shutil.copy2(path, dst)
+    return name, kind, [os.path.relpath(dst, data)]
+
+
+# ---- бекапы и сохранения
+BACKUP_SKIP = ("crashes", "logs")  # эти папки в бекап не кладём
+
+
+def backups_dir(root, name):
+    return os.path.join(container_dir(root, name), "backups")
+
+
+def saves_dir(root, name):
+    return os.path.join(container_dir(root, name), "data", "saves")
+
+
+def make_backup(root, name, label="manual"):
+    """Zip всей папки data контейнера -> (путь, число файлов); (None, 0), если копировать нечего."""
+    data = os.path.join(container_dir(root, name), "data")
+    if not os.path.isdir(data):
+        return None, 0
+    bdir = backups_dir(root, name)
+    os.makedirs(bdir, exist_ok=True)
+    final = unique_path(os.path.join(bdir, f"{time.strftime('%Y%m%d-%H%M%S')}_{label}.zip"))
+    tmp = final + ".part"
+    n = 0
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+            for dp, dns, fns in os.walk(data):
+                if os.path.normpath(dp) == os.path.normpath(data):
+                    dns[:] = [d for d in dns if d.lower() not in BACKUP_SKIP]
+                for fn in fns:
+                    full = os.path.join(dp, fn)
+                    try:
+                        z.write(full, os.path.relpath(full, data).replace(os.sep, "/"))
+                        n += 1
+                    except OSError:  # файл занят игрой или пропал - пропускаем
+                        pass
+        if n == 0:
+            return None, 0
+        os.replace(tmp, final)
+        return final, n
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def list_backups(root, name):
+    bdir = backups_dir(root, name)
+    res = []
+    try:
+        fns = os.listdir(bdir)
+    except OSError:
+        return res
+    for fn in fns:
+        if not fn.lower().endswith(".zip"):
+            continue
+        full = os.path.join(bdir, fn)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        stamp, _, lab = fn[:-4].partition("_")
+        res.append(dict(path=full, file=fn, mtime=st.st_mtime, size=st.st_size,
+                        label=(lab.split(" (")[0] or "?")))
+    res.sort(key=lambda b: b["file"], reverse=True)
+    return res
+
+
+def prune_backups(root, name, keep):
+    """Оставляет только `keep` последних автоматических бекапов (ручные не трогаем)."""
+    autos = [b for b in list_backups(root, name) if b["label"] == "auto"]
+    for b in autos[keep:]:
+        try:
+            os.remove(b["path"])
+        except OSError:
+            pass
+
+
+def restore_backup(root, name, path):
+    """Заменяет data контейнера содержимым бекапа (через временную папку, с откатом)."""
+    cdir = container_dir(root, name)
+    data, tmp, old = os.path.join(cdir, "data"), os.path.join(cdir, "_restore_tmp"), os.path.join(cdir, "_data_old")
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(old, ignore_errors=True)
+    os.makedirs(tmp)
+    try:
+        with zipfile.ZipFile(path) as z:
+            bad = z.testzip()
+            if bad:
+                raise RuntimeError(f"BACKUP IS CORRUPT ({bad})")
+            for info in z.infolist():
+                if not is_inside(os.path.join(tmp, info.filename), tmp):
+                    raise RuntimeError("UNSAFE PATH INSIDE BACKUP")
+            z.extractall(tmp)
+        had = os.path.isdir(data)
+        if had:
+            os.replace(data, old)
+        try:
+            os.replace(tmp, data)
+        except OSError:
+            if had:
+                os.replace(old, data)
+            raise
+        shutil.rmtree(old, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def list_saves(root, name):
+    d = saves_dir(root, name)
+    res = []
+    try:
+        fns = os.listdir(d)
+    except OSError:
+        return res
+    for fn in fns:
+        full = os.path.join(d, fn)
+        if fn.lower().endswith(".msav") and os.path.isfile(full):
+            st = os.stat(full)
+            res.append(dict(file=fn, path=full, size=st.st_size, mtime=st.st_mtime))
+    res.sort(key=lambda x: x["mtime"], reverse=True)
+    return res
+
+
+def install_saves(src, dest_dir):
+    """Кладёт .msav (или все .msav из .zip) в папку saves контейнера. -> [(имя, похоже ли на сейв)]"""
+    os.makedirs(dest_dir, exist_ok=True)
+    ext = os.path.splitext(src)[1].lower()
+    done = []
+    if ext == ".zip":
+        if not zipfile.is_zipfile(src):
+            raise RuntimeError("NOT A VALID ZIP FILE")
+        with zipfile.ZipFile(src) as z:
+            for info in z.infolist():
+                base = os.path.basename(info.filename)
+                if info.is_dir() or not base.lower().endswith(".msav"):
+                    continue
+                dst = unique_path(os.path.join(dest_dir, safe_file(base) or "save.msav"))
+                with z.open(info) as fi, open(dst, "wb") as fo:
+                    head = fi.read(4)
+                    fo.write(head)
+                    shutil.copyfileobj(fi, fo)
+                done.append((os.path.basename(dst), head == b"MSAV"))
+        if not done:
+            raise RuntimeError("NO .msav FILES INSIDE THE ZIP")
+    elif ext == ".msav":
+        with open(src, "rb") as f:
+            ok = f.read(4) == b"MSAV"
+        dst = unique_path(os.path.join(dest_dir, safe_file(os.path.basename(src)) or "save.msav"))
+        shutil.copy2(src, dst)
+        done.append((os.path.basename(dst), ok))
+    else:
+        raise RuntimeError(f"UNSUPPORTED FILE TYPE '{ext}' (USE .msav OR .zip)")
+    return done
+
+
+# ---- мониторинг процесса
+_WIN = {}
+
+
+def _win_sample(pid):
+    import ctypes
+    from ctypes import wintypes as wt
+    if not _WIN:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+        class PMC(ctypes.Structure):
+            _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD)] + [
+                (n, ctypes.c_size_t) for n in (
+                    "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                    "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage",
+                    "PeakPagefileUsage", "PrivateUsage")]
+        k32.OpenProcess.restype = wt.HANDLE
+        k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        k32.CloseHandle.argtypes = [wt.HANDLE]
+        k32.GetProcessTimes.argtypes = [wt.HANDLE] + [ctypes.POINTER(wt.FILETIME)] * 4
+        psapi.GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(PMC), wt.DWORD]
+        _WIN.update(k32=k32, psapi=psapi, PMC=PMC)
+    k32, psapi, PMC = _WIN["k32"], _WIN["psapi"], _WIN["PMC"]
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        ft = [wt.FILETIME() for _ in range(4)]
+        if not k32.GetProcessTimes(h, *[ctypes.byref(x) for x in ft]):
+            return None
+        cpu = sum(((x.dwHighDateTime << 32) | x.dwLowDateTime) for x in ft[2:]) / 1e7  # kernel + user
+        pm = PMC()
+        pm.cb = ctypes.sizeof(PMC)
+        if not psapi.GetProcessMemoryInfo(h, ctypes.byref(pm), pm.cb):
+            return None
+        return cpu, int(pm.WorkingSetSize)
+    finally:
+        k32.CloseHandle(h)
+
+
+def proc_sample(pid):
+    """-> (секунд процессора, байт ОЗУ) для процесса или None, если не удалось прочитать."""
+    try:
+        if IS_WIN:
+            return _win_sample(pid)
+        if os.path.isdir("/proc/self"):
+            with open(f"/proc/{pid}/stat") as f:
+                tail = f.read().rsplit(")", 1)[1].split()
+            tck = os.sysconf("SC_CLK_TCK")
+            cpu = (int(tail[11]) + int(tail[12])) / tck
+            with open(f"/proc/{pid}/statm") as f:
+                rss = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+            return cpu, rss
+        out = subprocess.run(["ps", "-o", "rss=,time=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=3).stdout.split()
+        parts = [float(x) for x in out[1].replace("-", ":").split(":")]
+        sec = 0.0
+        for x in parts:
+            sec = sec * 60 + x
+        return sec, int(out[0]) * 1024
+    except Exception:
+        return None
+
+
+def fmt_bytes(n):
+    mb = n / 1048576
+    return f"{mb / 1024:.2f}G" if mb >= 1024 else f"{mb:.0f}M"
+
+
+def fmt_clock(sec):
+    sec = int(sec)
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
 
 
 def is_inside(child, parent):
@@ -434,8 +967,8 @@ class App(tk.Tk):
         super().__init__()
         self.sc = max(1.0, self.winfo_fpixels("1i") / 96.0)
         self.title("MINDUSTRY // LAUNCHER")
-        self.geometry(f"{int(960 * self.sc)}x{int(680 * self.sc)}")
-        self.minsize(int(840 * self.sc), int(600 * self.sc))
+        self.geometry(f"{int(1020 * self.sc)}x{int(720 * self.sc)}")
+        self.minsize(int(980 * self.sc), int(680 * self.sc))
 
         self.S = Settings()
         self.t = THEMES[self.S.get("theme")]
@@ -456,18 +989,76 @@ class App(tk.Tk):
         self.busy = False
         self.progress = None
         self.running = {}
+        self.v_ws_cont = tk.StringVar()
+        self.v_ws_items = tk.StringVar()
+        self.v_ws_query = tk.StringVar()
+        self.v_ws_sort = tk.StringVar(value="TRENDING")
+        self.ws_ids = []
+        self.ws_items = []
+        self.ws_mode = "browse"
+        self.ws_page = 1
+        self.ws_loaded = False
+        self.ws_previews = {}
+        self._ws_tok = 0
+        self._ws_img = None
+        self.ws_type = "all"
         self.java_info = "..."
         self.page = "containers"
         self.containers = []
         self.v_tags = []
         self.c_names = []
 
+        self.bind_all("<Control-KeyPress>", self._ctrl_keys)
+        self.sessions = {}  # имя контейнера -> время последней записи наигранного
+        self.mon = {}       # имя контейнера -> данные мониторинга процесса
+        self.pending = set()  # контейнеры, ожидающие автобекапа перед запуском
+        self.ncpu = os.cpu_count() or 1
+        self.sv_mode = "saves"
+        self.v_sv_cont = tk.StringVar()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.make_dirs()
         self.build_all()
         self.after(40, self._poll)
+        self.after(30000, self._tick_play)
+        self.after(2000, self._tick_mon)
         self.log("SYSTEM ONLINE. ROOT = " + self.root)
         self.refresh_releases()
         self.detect_java()
+
+    # ----------------------------------------------------------- буфер обмена
+    # Tk привязывает Ctrl+C/V/X к буквам латиницы, поэтому с русской раскладкой
+    # они не работают. Ловим их по коду клавиши.
+    CTRL_CODES = ({86: "paste", 67: "copy", 88: "cut", 65: "all"} if IS_WIN
+                  else {55: "paste", 54: "copy", 53: "cut", 38: "all"})
+
+    def _ctrl_keys(self, e):
+        if e.keysym.lower() in ("v", "c", "x"):
+            return None  # латиница: стандартные привязки Tk справятся сами
+        # Ctrl+A обрабатываем всегда: в Tk он по умолчанию не выделяет всё
+        act = self.CTRL_CODES.get(e.keycode)
+        w = e.widget
+        if not act or not isinstance(w, (tk.Entry, tk.Text)):
+            return None
+        if act == "all":
+            if isinstance(w, tk.Entry):
+                w.select_range(0, "end")
+                w.icursor("end")
+            else:
+                w.tag_add("sel", "1.0", "end")
+        else:
+            w.event_generate({"paste": "<<Paste>>", "copy": "<<Copy>>", "cut": "<<Cut>>"}[act])
+        return "break"
+
+    def _entry_menu(self, e):
+        w, t = e.widget, self.t
+        w.focus_set()
+        menu = tk.Menu(self, tearoff=0, font=self.font, bg=t["panel"], fg=t["fg"],
+                       activebackground=t["fg"], activeforeground=t["bg"], bd=0)
+        for label, ev in (("Cut", "<<Cut>>"), ("Copy", "<<Copy>>"), ("Paste", "<<Paste>>")):
+            menu.add_command(label=label, command=lambda ev=ev: w.event_generate(ev))
+        menu.add_separator()
+        menu.add_command(label="Select all", command=lambda: w.select_range(0, "end"))
+        menu.tk_popup(e.x_root, e.y_root)
 
     # ----------------------------------------------------------- базовое
     @property
@@ -526,6 +1117,7 @@ class App(tk.Tk):
                      readonlybackground=t["panel"], disabledforeground=t["dim"])
         if readonly:
             e.config(state="readonly")
+        e.bind("<Button-3>", self._entry_menu)
         return e
 
     def label(self, parent, text, dim=False, bold=False, accent=False, **kw):
@@ -556,6 +1148,16 @@ class App(tk.Tk):
         sc.pack(side="right", fill="y")
         lb.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=2)
         return wrap, lb
+
+    def optmenu(self, parent, var, values, command=None):
+        t = self.t
+        om = tk.OptionMenu(parent, var, *values, command=command)
+        om.config(font=self.font, bg=t["panel"], fg=t["fg"], activebackground=t["fg"],
+                  activeforeground=t["bg"], highlightthickness=1, highlightbackground=t["dim"],
+                  bd=0, relief="flat", anchor="w")
+        om["menu"].config(font=self.font, bg=t["panel"], fg=t["fg"], activebackground=t["fg"],
+                          activeforeground=t["bg"], bd=0, relief="flat")
+        return om
 
     # ----------------------------------------------------------- диалоги
     def make_dialog(self, title):
@@ -622,13 +1224,14 @@ class App(tk.Tk):
 
         foot, fbody = self.panel(self, "CONSOLE.LOG")
         foot.pack(side="bottom", fill="x", padx=10, pady=(8, 10))
-        self.log_w = tk.Text(fbody, height=8, font=self.font_s, bg=t["bg"], fg=t["fg"], bd=0,
+        self.log_w = tk.Text(fbody, height=6, font=self.font_s, bg=t["bg"], fg=t["fg"], bd=0,
                              highlightthickness=0, wrap="word", state="disabled",
                              selectbackground=t["fg"], selectforeground=t["bg"], cursor="arrow")
         self.log_w.tag_config("info", foreground=t["fg"])
         self.log_w.tag_config("err", foreground=t["acc"])
         self.log_w.tag_config("game", foreground=t["dim"])
         self.log_w.pack(fill="x")
+        self.log_w.bind("<Button-1>", lambda e: self.log_w.focus_set())  # чтобы работало Ctrl+C
         for line, lvl in self.log_lines[-300:]:
             self._log_write(line, lvl)
 
@@ -689,7 +1292,8 @@ class App(tk.Tk):
         short = root if len(root) <= 22 else "..." + root[-19:]
         inst = len(installed_tags(root, self.releases))
         txt = (f"JAVA\n{self.java_info}\n\nROOT\n{short}\n\n"
-               f"CONTAINERS  {len(load_containers(root))}\nINSTALLED   {inst}\nRUNNING     {len(self.running)}")
+               f"CONTAINERS  {len(load_containers(root))}\nINSTALLED   {inst}\nRUNNING     {len(self.running)}"
+               f"\n\nPLAYED TOTAL\n{fmt_dur(self.play_total())}")
         try:
             self.info_w.config(text=txt)
         except tk.TclError:
@@ -697,14 +1301,14 @@ class App(tk.Tk):
 
     # ----------------------------------------------------------- страница: контейнеры
     @staticmethod
-    def c_row(a, b, c, d):
-        return f"  {a:<18.18} {b:<14.14} {c:<13.13} {d}"
+    def c_row(a, b, c, p, d):
+        return f"  {a:<15.15} {b:<10.10} {c:<11.11} {p:<8.8} {d}"
 
     def page_containers(self):
         t = self.t
         outer, body = self.panel(self.content, "CONTAINERS.RSU")
         outer.pack(fill="both", expand=True)
-        tk.Label(body, text=self.c_row("NAME", "VERSION", "RAM", "STATE"), font=self.font,
+        tk.Label(body, text=self.c_row("NAME", "VERSION", "RAM", "PLAYED", "STATE"), font=self.font,
                  bg=t["bg"], fg=t["dim"], anchor="w").pack(fill="x")
         mid = tk.Frame(body, bg=t["bg"])
         mid.pack(fill="both", expand=True, pady=(2, 8))
@@ -761,7 +1365,8 @@ class App(tk.Tk):
             mn = parse_ram(c["ram_min"] or self.S.get("ram_min")) or 256
             mx = parse_ram(c["ram_max"] or self.S.get("ram_max")) or 2048
             st, col = self.c_state(c)
-            lb.insert("end", self.c_row(c["name"], c["version"], f"{fmt_ram(mn)}-{fmt_ram(mx)}", st))
+            lb.insert("end", self.c_row(c["name"], c["version"], f"{fmt_ram(mn)}-{fmt_ram(mx)}",
+                                        fmt_dur(self.play_secs(c["name"])), st))
             lb.itemconfig(i, foreground=col)
         if self.c_names:
             idx = self.c_names.index(select) if select in self.c_names else 0
@@ -817,7 +1422,9 @@ class App(tk.Tk):
         self.ic_lbl.config(image=img if img else "", text="" if img else initials)
         mn = parse_ram(c["ram_min"] or self.S.get("ram_min")) or 256
         mx = parse_ram(c["ram_max"] or self.S.get("ram_max")) or 2048
-        lines = [c["name"], "", f"VERSION  {c['version']}", f"RAM      {fmt_ram(mn)}-{fmt_ram(mx)}"]
+        lines = [c["name"], "", f"VERSION  {c['version']}", f"RAM      {fmt_ram(mn)}-{fmt_ram(mx)}",
+                 f"PLAYED   {fmt_dur(self.play_secs(c['name']))}",
+                 f"LAUNCHES {container_stats(self.root, c['name'])[1]}"]
         if c["jvm_args"]:
             lines.append(f"JVM      {c['jvm_args']}")
         if c["game_args"]:
@@ -876,6 +1483,10 @@ class App(tk.Tk):
                         p = os.path.join(src, f)
                         if os.path.isfile(p):
                             shutil.copy2(p, dst)
+                try:  # у клона своя статистика с нуля
+                    os.remove(os.path.join(dst, "stats.json"))
+                except OSError:
+                    pass
                 self.ui(self._clone_done, name, None)
             except Exception as e:
                 shutil.rmtree(dst, ignore_errors=True)
@@ -1090,6 +1701,34 @@ class App(tk.Tk):
         self.show_dialog(d)
         return res["v"]
 
+    # ----------------------------------------------------------- время игры
+    def play_secs(self, name):
+        saved, _ = container_stats(self.root, name)
+        last = self.sessions.get(name)
+        return saved + (time.time() - last if last else 0)
+
+    def play_total(self):
+        total = float(load_json(GLOBAL_STATS, {}).get("seconds", 0) or 0)
+        return total + sum(time.time() - last for last in self.sessions.values())
+
+    def _tick_play(self):
+        """Раз в 30 с сохраняем наигранное, чтобы время не терялось при закрытии лаунчера."""
+        now = time.time()
+        for name, last in list(self.sessions.items()):
+            add_playtime(self.root, name, now - last)
+            self.sessions[name] = now
+        if self.sessions:
+            self.refresh_info()
+            if self.page == "containers":
+                self.refresh_containers()
+        self.after(30000, self._tick_play)
+
+    def _on_close(self):
+        now = time.time()
+        for name, last in list(self.sessions.items()):
+            add_playtime(self.root, name, now - last)
+        self.destroy()
+
     # ----------------------------------------------------------- запуск игры
     def launch(self, c):
         name = c["name"]
@@ -1103,6 +1742,44 @@ class App(tk.Tk):
             self.alert("JAVA NOT FOUND", "MINDUSTRY NEEDS JAVA 17 OR NEWER.\n"
                                          "INSTALL IT (E.G. ECLIPSE TEMURIN, adoptium.net)\n"
                                          "OR SET java_path IN SETTINGS.INI.")
+            return
+        if name in self.pending:
+            return
+        data = os.path.join(container_dir(root, name), "data")
+        if self.S.get("auto_backup") == "1" and os.path.isdir(data) and os.listdir(data):
+            self.pending.add(name)
+            self.busy = True
+            self.update_state()
+            self.log(f"[{name}] AUTO BACKUP BEFORE LAUNCH ...")
+            keep = int(self.S.get("backup_keep"))
+
+            def work():
+                try:
+                    path, n = make_backup(root, name, "auto")
+                    prune_backups(root, name, keep)
+                    self.ui(self._after_auto_backup, c, java, path, n, None)
+                except Exception as e:
+                    self.ui(self._after_auto_backup, c, java, None, 0, e)
+
+            threading.Thread(target=work, daemon=True).start()
+            return
+        self._spawn(c, java)
+
+    def _after_auto_backup(self, c, java, path, n, err):
+        self.pending.discard(c["name"])
+        self.busy = False
+        self.update_state()
+        if err:
+            self.log(f"[{c['name']}] AUTO BACKUP FAILED (LAUNCHING ANYWAY): {err}", "err")
+        elif path:
+            self.log(f"[{c['name']}] BACKUP {os.path.basename(path)} ({n} FILES)")
+        self.refresh_saves_page()
+        self._spawn(c, java)
+
+    def _spawn(self, c, java):
+        name = c["name"]
+        root = self.root
+        if name in self.running:
             return
         mn = parse_ram(c["ram_min"] or self.S.get("ram_min")) or 256
         mx = parse_ram(c["ram_max"] or self.S.get("ram_max")) or 2048
@@ -1128,10 +1805,15 @@ class App(tk.Tk):
             self.log(f"LAUNCH FAILED: {e}", "err")
             return
         self.running[name] = p
+        self.sessions[name] = time.time()
+        self.mon[name] = dict(start=time.time(), last=None, hist=[], peak_rss=0, peak_cpu=0.0, xmx=mx)
+        add_playtime(root, name, 0, launches=1)
         self.log(f"[{name}] STARTED  {c['version']}  Xms{mn}m Xmx{mx}m")
         threading.Thread(target=self._watch, args=(name, p), daemon=True).start()
         self.update_state()
         self.refresh_containers(name)
+        if self.page == "monitor":
+            self.mon_refresh()
 
     def _watch(self, name, p):
         try:
@@ -1145,10 +1827,16 @@ class App(tk.Tk):
         self.ui(self._exited, name, code)
 
     def _exited(self, name, code):
+        last = self.sessions.pop(name, None)
+        if last:
+            add_playtime(self.root, name, time.time() - last)
         self.running.pop(name, None)
+        self.mon.pop(name, None)
         self.log(f"[{name}] EXITED (code {code})", "err" if code not in (0, None) and code > 0 else "info")
         self.update_state()
         self.refresh_containers()
+        if self.page == "monitor":
+            self.mon_refresh()
 
     # ----------------------------------------------------------- страница: версии
     @staticmethod
@@ -1335,6 +2023,907 @@ class App(tk.Tk):
                     pass
         self.refresh_versions()
 
+    # ----------------------------------------------------------- страница: мастерская Steam
+    def ws_dir(self):
+        return steam_dir(self.root)
+
+    def ws_manifest(self, cname):
+        return os.path.join(container_dir(self.root, cname), "workshop.json")
+
+    def page_workshop(self):
+        t = self.t
+        outer, body = self.panel(self.content, "WORKSHOP.SYS")
+        outer.pack(fill="both", expand=True)
+        names = [c["name"] for c in load_containers(self.root)]
+        if not names:
+            self.label(body, "NO CONTAINERS. CREATE ONE IN CONTAINERS.RSU FIRST.", dim=True).pack(anchor="w")
+            return
+        if self.v_ws_cont.get() not in names:
+            self.v_ws_cont.set(names[0])
+        top = tk.Frame(body, bg=t["bg"])
+        top.pack(fill="x")
+        self.label(top, "container", dim=True).pack(side="left", padx=(0, 10))
+        self.optmenu(top, self.v_ws_cont, names, command=lambda v: self.ws_update()).pack(side="left")
+        self.btn(top, "IMPORT FILES", self.ws_import_files).pack(side="left", padx=(14, 0))
+        self.btn(top, "IMPORT DIR", self.ws_import_folder).pack(side="left", padx=(6, 0))
+        self.ws_tabs = {}
+        for key, text in (("installed", "INSTALLED"), ("browse", "BROWSE")):
+            b = self.btn(top, text, lambda k=key: self.ws_set_mode(k))
+            b.pack(side="right", padx=(6, 0))
+            self.ws_tabs[key] = b
+        self.label(body, "! STEAM WORKSHOP DOWNLOADS NEED A STEAM ACCOUNT WITH A PURCHASED COPY OF MINDUSTRY "
+                         "(SET steam_user IN SETTINGS.INI). IMPORT WORKS WITHOUT IT.",
+                   accent=True, wraplength=int(660 * self.sc), justify="left", anchor="w").pack(fill="x", pady=(6, 0))
+        self.ws_msg = self.label(body, "", dim=True, anchor="w")
+        self.ws_msg.pack(fill="x", pady=(2, 0))
+        self.ws_area = tk.Frame(body, bg=t["bg"])
+        self.ws_area.pack(fill="both", expand=True)
+        self.ws_set_mode(self.ws_mode)
+
+    def ws_import_files(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, title="IMPORT MAPS / SCHEMATICS / MODS",
+            filetypes=[("Mindustry content", "*.msav *.msch *.zip *.jar"), ("all", "*.*")])
+        if paths:
+            self._ws_import(list(paths))
+
+    def ws_import_folder(self):
+        p = filedialog.askdirectory(parent=self, title="IMPORT UNPACKED MOD FOLDER")
+        if p:
+            self._ws_import([p])
+
+    def _ws_import(self, paths):
+        cname = self.v_ws_cont.get()
+        data = os.path.join(container_dir(self.root, cname), "data")
+        mpath = self.ws_manifest(cname)
+        man = load_json(mpath, {})
+        ok = 0
+        for p in paths:
+            try:
+                title, kind, files = import_local_item(p, data)
+                wid, n = f"L{int(time.time())}", 0
+                while f"{wid}{n}" in man:
+                    n += 1
+                man[f"{wid}{n}"] = {"title": title, "kind": kind, "files": files}
+                self.log(f"IMPORTED {kind.upper()} '{title}' -> '{cname}': {', '.join(files)}")
+                ok += 1
+            except Exception as e:
+                bn = os.path.basename(p.rstrip("/\\"))
+                self.log(f"IMPORT FAILED '{bn}': {e}", "err")
+        if ok:
+            save_json(mpath, man)
+        self.ws_say(f"IMPORTED {ok}/{len(paths)}" + ("" if ok == len(paths) else " (SEE CONSOLE)"),
+                    ok != len(paths))
+        self.ws_update()
+
+    def ws_set_mode(self, mode):
+        self.ws_mode = mode
+        self.ws_say("")
+        for k, b in self.ws_tabs.items():
+            b.activate(k == mode)
+        for w in self.ws_area.winfo_children():
+            w.destroy()
+        (self.ws_build_browse if mode == "browse" else self.ws_build_installed)()
+
+    def ws_say(self, text, err=False):
+        try:
+            self.ws_msg.config(text=text, fg=self.t["acc"] if err else self.t["dim"])
+        except (AttributeError, tk.TclError):
+            pass
+
+    def ws_update(self):
+        if self.page != "workshop":
+            return
+        if self.ws_mode == "browse":
+            self.ws_fill()
+        else:
+            self.ws_refresh()
+
+    # ---- режим INSTALLED: что уже скачано в контейнер
+    def ws_build_installed(self):
+        t, a = self.t, self.ws_area
+        tk.Label(a, text=f"  {'ID':<12} {'TYPE':<10} TITLE", font=self.font, bg=t["bg"],
+                 fg=t["dim"], anchor="w").pack(fill="x", pady=(8, 0))
+        wrap, self.ws_lb = self.listbox(a)
+        wrap.pack(fill="both", expand=True, pady=(2, 8))
+        row = tk.Frame(a, bg=t["bg"])
+        row.pack(fill="x")
+        self.btn(row, "REMOVE", self.ws_remove).pack(side="left", padx=(0, 8))
+        self.btn(row, "OPEN DIR", lambda: self.safe_open(
+            os.path.join(container_dir(self.root, self.v_ws_cont.get()), "data"))).pack(side="left")
+        self.ws_refresh()
+
+    def ws_refresh(self):
+        if self.page != "workshop":
+            return
+        try:
+            lb = self.ws_lb
+            lb.delete(0, "end")
+        except (AttributeError, tk.TclError):
+            return
+        self.ws_ids = []
+        man = load_json(self.ws_manifest(self.v_ws_cont.get()), {})
+        for wid, it in man.items():
+            lb.insert("end", f"  {wid:<12} {str(it.get('kind', '?')):<10.10} {it.get('title', '')}")
+            self.ws_ids.append(wid)
+        if not self.ws_ids:
+            lb.insert("end", "  NOTHING DOWNLOADED YET.")
+            lb.itemconfig(0, foreground=self.t["dim"])
+
+    def ws_selected(self):
+        try:
+            s = self.ws_lb.curselection()
+            return self.ws_ids[s[0]] if s and s[0] < len(self.ws_ids) else None
+        except (AttributeError, tk.TclError):
+            return None
+
+    # ---- режим BROWSE: каталог мастерской с превью
+    def ws_build_browse(self):
+        t, a = self.t, self.ws_area
+        bar = tk.Frame(a, bg=t["bg"])
+        bar.pack(fill="x", pady=(8, 6))
+        e = self.entry(bar, self.v_ws_query, 28)
+        e.pack(side="left", ipady=2)
+        e.bind("<Return>", lambda ev: self.ws_search(1))
+        self.optmenu(bar, self.v_ws_sort, list(BROWSE_SORTS), command=lambda v: self.ws_search(1)).pack(
+            side="left", padx=(8, 0))
+        self.btn(bar, "SEARCH", lambda: self.ws_search(1), accent=True).pack(side="left", padx=(8, 0))
+
+        paste = tk.Frame(a, bg=t["bg"])
+        paste.pack(side="bottom", fill="x", pady=(8, 0))
+        self.label(paste, "link / id", dim=True).pack(side="left", padx=(0, 10))
+        e2 = self.entry(paste, self.v_ws_items, 40)
+        e2.pack(side="left", fill="x", expand=True, ipady=2)
+        e2.bind("<Return>", lambda ev: self.ws_download())
+        self.btn(paste, "DOWNLOAD", self.ws_download).pack(side="left", padx=(8, 0))
+        pager = tk.Frame(a, bg=t["bg"])
+        pager.pack(side="bottom", fill="x", pady=(6, 0))
+        self.btn(pager, "< PREV", lambda: self.ws_search(max(1, self.ws_page - 1))).pack(side="left")
+        self.ws_pg = self.label(pager, f"PAGE {self.ws_page}", dim=True)
+        self.ws_pg.pack(side="left", padx=10)
+        self.btn(pager, "NEXT >", lambda: self.ws_search(self.ws_page + 1)).pack(side="left")
+
+        mid = tk.Frame(a, bg=t["bg"])
+        mid.pack(fill="both", expand=True)
+        card = tk.Frame(mid, bg=t["bg"], width=int(290 * self.sc), highlightthickness=1,
+                        highlightbackground=t["dim"])
+        card.pack(side="right", fill="y", padx=(10, 0))
+        card.pack_propagate(False)
+        brow = tk.Frame(card, bg=t["bg"])  # кнопки пакуем первыми, чтобы им всегда хватало места
+        brow.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+        self.ws_bdl = self.btn(brow, "DOWNLOAD", self.ws_dl_selected, accent=True)
+        self.ws_bdl.pack(side="left")
+        self.ws_bst = self.btn(brow, "STEAM PAGE", self.ws_open_steam)
+        self.ws_bst.pack(side="left", padx=(8, 0))
+        self.ws_psize = int(150 * self.sc)
+        box = tk.Frame(card, bg=t["panel"], width=self.ws_psize, height=self.ws_psize,
+                       highlightthickness=1, highlightbackground=t["fg"])
+        box.pack(pady=(10, 6))
+        box.pack_propagate(False)
+        self.ws_prev = tk.Label(box, bg=t["panel"], fg=t["dim"], bd=0, font=self.font_s, text="")
+        self.ws_prev.pack(expand=True)
+        self.ws_title = tk.Label(card, bg=t["bg"], fg=t["fg"], font=self.font_b, anchor="w",
+                                 justify="left", wraplength=int(265 * self.sc))
+        self.ws_title.pack(fill="x", padx=10)
+        self.ws_meta = tk.Label(card, bg=t["bg"], fg=t["dim"], font=self.font_s, anchor="w", justify="left")
+        self.ws_meta.pack(fill="x", padx=10, pady=(2, 0))
+        self.ws_desc = tk.Text(card, bg=t["bg"], fg=t["dim"], font=self.font_s, bd=0, wrap="word",
+                               highlightthickness=0, state="disabled", height=4, cursor="arrow",
+                               selectbackground=t["fg"], selectforeground=t["bg"])
+        self.ws_desc.pack(fill="both", expand=True, padx=10, pady=6)
+
+        wrap, self.ws_rl = self.listbox(mid)
+        wrap.pack(side="left", fill="both", expand=True)
+        self.ws_rl.bind("<<ListboxSelect>>", lambda ev: self.ws_show())
+        self.ws_rl.bind("<Double-Button-1>", lambda ev: self.ws_dl_selected())
+        self.ws_fill()
+        if not self.ws_loaded:
+            self.ws_search(1)
+
+    def ws_search(self, page=1):
+        self._ws_tok += 1
+        token = self._ws_tok
+        self.ws_page = page
+        q, sort = self.v_ws_query.get().strip(), self.v_ws_sort.get()
+        self.ws_say("LOADING WORKSHOP ...")
+        try:
+            self.ws_pg.config(text=f"PAGE {page}")
+        except (AttributeError, tk.TclError):
+            pass
+
+        def work():
+            try:
+                ids = workshop_search(q, sort, page)
+                det = workshop_details_many(ids) if ids else {}
+                items = [dict(det[i], id=i) for i in ids if i in det and det[i]["app"] == APP_ID]
+                self.ui(self._ws_results, token, items, None)
+            except Exception as e:
+                self.ui(self._ws_results, token, [], e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ws_results(self, token, items, err):
+        if token != self._ws_tok:
+            return
+        self.ws_loaded = True
+        self.ws_items = items
+        if err:
+            self.ws_say(f"! LOAD FAILED: {err}", True)
+            self.log(f"WORKSHOP LOAD FAILED: {err}", "err")
+        else:
+            self.ws_say("" if items else "NO RESULTS")
+        if self.page == "workshop" and self.ws_mode == "browse":
+            self.ws_fill()
+            try:
+                if items:
+                    self.ws_rl.selection_set(0)
+                self.ws_show()
+            except (AttributeError, tk.TclError):
+                pass
+
+    def ws_fill(self):
+        try:
+            lb = self.ws_rl
+            lb.delete(0, "end")
+        except (AttributeError, tk.TclError):
+            return
+        man = load_json(self.ws_manifest(self.v_ws_cont.get()), {})
+        for it in self.ws_items:
+            have = it["id"] in man
+            lb.insert("end", f"  {'[x]' if have else '[ ]'} {it['title']:<30.30} "
+                             f"{fmt_num(it['subs']):>6}  {'/'.join(it['tags'])[:14]}")
+            lb.itemconfig(lb.size() - 1, foreground=self.t["acc"] if have else self.t["fg"])
+        if not self.ws_items:
+            lb.insert("end", "  NOTHING TO SHOW.")
+            lb.itemconfig(0, foreground=self.t["dim"])
+
+    def ws_cur(self):
+        try:
+            s = self.ws_rl.curselection()
+            return self.ws_items[s[0]] if s and s[0] < len(self.ws_items) else None
+        except (AttributeError, tk.TclError):
+            return None
+
+    def ws_show(self):
+        it = self.ws_cur()
+        try:
+            self.ws_desc.config(state="normal")
+            self.ws_desc.delete("1.0", "end")
+            if not it:
+                self.ws_title.config(text="")
+                self.ws_meta.config(text="")
+                self.ws_prev.config(image="", text="")
+                self._ws_img = None
+                self.ws_desc.config(state="disabled")
+                self.ws_bdl.enable(False)
+                self.ws_bst.enable(False)
+                return
+            upd = time.strftime("%Y-%m-%d", time.localtime(it["updated"])) if it["updated"] else "-"
+            self.ws_title.config(text=it["title"])
+            self.ws_meta.config(text=f"TAGS  {', '.join(it['tags']) or '-'}\n"
+                                     f"SUBS  {fmt_num(it['subs'])}   SIZE {fmt_size(it['size'])}\n"
+                                     f"UPD   {upd}")
+            self.ws_desc.insert("1.0", it["desc"] or "(no description)")
+            self.ws_desc.config(state="disabled")
+            self.ws_bdl.enable(True)
+            self.ws_bst.enable(True)
+            self.ws_prev.config(image="", text="LOADING ...")
+            self._ws_img = None
+        except (AttributeError, tk.TclError):
+            return
+        wid = it["id"]
+        if wid in self.ws_previews:
+            self._ws_apply_preview(wid)
+            return
+
+        def work():
+            try:
+                data = fetch_preview(it["preview"])
+            except Exception:
+                data = b""
+            self.ui(self._ws_got_preview, wid, data)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ws_got_preview(self, wid, data):
+        if len(self.ws_previews) > 80:
+            self.ws_previews.clear()
+        self.ws_previews[wid] = data
+        cur = self.ws_cur()
+        if cur and cur["id"] == wid:
+            self._ws_apply_preview(wid)
+
+    def make_image(self, data, size):
+        if HAVE_PIL:
+            im = Image.open(io.BytesIO(data)).convert("RGB")
+            im.thumbnail((size, size))
+            return ImageTk.PhotoImage(im)
+        im = tk.PhotoImage(data=base64.b64encode(data))  # без Pillow только PNG/GIF
+        big = max(im.width(), im.height(), 1)
+        if big > size:
+            im = im.subsample(-(-big // size))
+        return im
+
+    def _ws_apply_preview(self, wid):
+        data = self.ws_previews.get(wid)
+        img = None
+        if data:
+            try:
+                img = self.make_image(data, self.ws_psize - 4)
+            except Exception:
+                img = None
+        self._ws_img = img
+        try:
+            self.ws_prev.config(image=img if img else "", text="" if img else "NO PREVIEW")
+        except tk.TclError:
+            pass
+
+    def ws_dl_selected(self):
+        it = self.ws_cur()
+        if it:
+            self.ws_download([it["id"]])
+
+    def ws_open_steam(self):
+        it = self.ws_cur()
+        if it:
+            webbrowser.open(f"https://steamcommunity.com/sharedfiles/filedetails/?id={it['id']}")
+
+    # ---- общее
+
+    def ws_download(self, ids=None):
+        if self.busy:
+            self.ws_say("! WAIT, ANOTHER OPERATION IS RUNNING", True)
+            return
+        if ids is None:
+            ids = parse_workshop_ids(self.v_ws_items.get())
+        cname = self.v_ws_cont.get()
+        if not ids:
+            self.ws_say("! NO ITEM LINK OR ID FOUND", True)
+            return
+        self.ws_say("DOWNLOADING ... (DETAILS IN CONSOLE)")
+        root = self.root
+        data = os.path.join(container_dir(root, cname), "data")
+        sdir = self.ws_dir()
+        mpath = self.ws_manifest(cname)
+        login = self.S.get("steam_user").strip() or "anonymous"
+        self.busy = True
+        self.update_state()
+        self.log(f"WORKSHOP: {len(ids)} ITEM(S) -> '{cname}'")
+
+        def log(m, lvl="info"):
+            self.ui(self.log, m, lvl)
+
+        def work():
+            ok = 0
+            try:
+                exe = ensure_steamcmd(sdir, log)
+            except Exception as e:
+                log(f"STEAMCMD SETUP FAILED: {e}", "err")
+                self.ui(self._ws_done, 0, len(ids))
+                return
+            dl = os.path.join(sdir, "dl")
+            for wid in ids:
+                try:
+                    det = None
+                    try:
+                        det = workshop_details(wid)
+                    except Exception:
+                        pass
+                    if det and det["app"] != APP_ID:
+                        raise RuntimeError("NOT A MINDUSTRY ITEM")
+                    if det and det.get("banned"):
+                        raise RuntimeError("ITEM IS BANNED OR REMOVED")
+                    if det and det.get("visibility") in (1, 2):
+                        raise RuntimeError("ITEM IS PRIVATE OR FRIENDS-ONLY, STEAM WILL NOT GIVE IT TO ANYONE ELSE")
+                    title = (det or {}).get("title") or f"item_{wid}"
+                    log(f"[{wid}] {title}")
+                    content = os.path.join(dl, "steamapps", "workshop", "content", str(APP_ID), wid)
+                    errors = []
+                    for _attempt in (1, 2):
+                        shutil.rmtree(content, ignore_errors=True)
+                        errors = run_steamcmd(exe, ["+force_install_dir", dl, "+login", login,
+                                                    "+workshop_download_item", str(APP_ID), wid, "+quit"], log)
+                        if os.path.isdir(content) and os.listdir(content):
+                            break
+                    if not (os.path.isdir(content) and os.listdir(content)):
+                        msg = errors[-1] if errors else "NOTHING DOWNLOADED (PRIVATE ITEM OR NO CONNECTION)"
+                        low = " ".join(errors).lower()
+                        if login == "anonymous" and errors:
+                            msg += (" | STEAM REFUSED THE ANONYMOUS DOWNLOAD. THE ITEM MAY BE RESTRICTED "
+                                    "OR NEED AN ACCOUNT THAT OWNS MINDUSTRY (OPTIONAL steam_user IN SETTINGS.INI)")
+                        elif any(w in low for w in ("password", "login", "credential", "guard")):
+                            msg += " | PRESS LOGIN IN SETTINGS.INI TO SIGN IN AGAIN"
+                        raise RuntimeError(msg)
+                    kind, files = install_workshop_item(content, data, title, wid)
+                    man = load_json(mpath, {})
+                    man[wid] = {"title": title, "kind": kind, "files": files}
+                    save_json(mpath, man)
+                    log(f"[{wid}] INSTALLED AS {kind.upper()}: {', '.join(files)}")
+                    ok += 1
+                except Exception as e:
+                    log(f"[{wid}] FAILED: {e}", "err")
+            self.ui(self._ws_done, ok, len(ids))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ws_done(self, ok, total):
+        self.busy = False
+        self.update_state()
+        self.log(f"WORKSHOP DONE: {ok}/{total}", "info" if ok == total else "err")
+        if ok:
+            self.v_ws_items.set("")
+        self.ws_say(f"DONE: {ok}/{total}" if ok == total else f"DONE: {ok}/{total} (SEE CONSOLE)", ok != total)
+        self.ws_update()
+        self.refresh_info()
+
+    def ws_remove(self):
+        wid = self.ws_selected()
+        cname = self.v_ws_cont.get()
+        if not wid:
+            return
+        mp = self.ws_manifest(cname)
+        man = load_json(mp, {})
+        it = man.get(wid)
+        if not it:
+            return
+        if not self.confirm("REMOVE ITEM", f"REMOVE '{it.get('title', wid)}' FROM '{cname}'?",
+                            "REMOVE", danger=True):
+            return
+        data = os.path.join(container_dir(self.root, cname), "data")
+        for rel in it.get("files", []):
+            p = os.path.normpath(os.path.join(data, rel))
+            if not is_inside(p, data):
+                continue
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            elif os.path.isfile(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        man.pop(wid, None)
+        save_json(mp, man)
+        self.log(f"WORKSHOP ITEM {wid} REMOVED FROM '{cname}'")
+        self.ws_refresh()
+
+    # ----------------------------------------------------------- страница: сейвы и бекапы
+    def sv_cname(self):
+        return self.v_sv_cont.get()
+
+    def page_saves(self):
+        t = self.t
+        outer, body = self.panel(self.content, "SAVES.BAK")
+        outer.pack(fill="both", expand=True)
+        names = [c["name"] for c in load_containers(self.root)]
+        if not names:
+            self.label(body, "NO CONTAINERS. CREATE ONE IN CONTAINERS.RSU FIRST.", dim=True).pack(anchor="w")
+            return
+        if self.v_sv_cont.get() not in names:
+            self.v_sv_cont.set(names[0])
+        top = tk.Frame(body, bg=t["bg"])
+        top.pack(fill="x")
+        self.label(top, "container", dim=True).pack(side="left", padx=(0, 10))
+        self.optmenu(top, self.v_sv_cont, names, command=lambda v: self.sv_refresh()).pack(side="left")
+        self.sv_tabs = {}
+        for key, text in (("backups", "BACKUPS"), ("saves", "SAVES")):
+            b = self.btn(top, text, lambda k=key: self.sv_set_mode(k))
+            b.pack(side="right", padx=(6, 0))
+            self.sv_tabs[key] = b
+        self.sv_msg = self.label(body, "", dim=True, anchor="w")
+        self.sv_msg.pack(fill="x", pady=(6, 0))
+        self.sv_area = tk.Frame(body, bg=t["bg"])
+        self.sv_area.pack(fill="both", expand=True)
+        self.sv_set_mode(self.sv_mode)
+
+    def sv_say(self, text, err=False):
+        try:
+            self.sv_msg.config(text=text, fg=self.t["acc"] if err else self.t["dim"])
+        except (AttributeError, tk.TclError):
+            pass
+
+    def sv_set_mode(self, mode):
+        self.sv_mode = mode
+        self.sv_say("")
+        for k, b in self.sv_tabs.items():
+            b.activate(k == mode)
+        for w in self.sv_area.winfo_children():
+            w.destroy()
+        (self.sv_build_saves if mode == "saves" else self.sv_build_backups)()
+
+    def refresh_saves_page(self):
+        if self.page == "saves":
+            self.sv_refresh()
+
+    def sv_refresh(self):
+        if self.page != "saves":
+            return
+        try:
+            lb = self.sv_lb
+            lb.delete(0, "end")
+        except (AttributeError, tk.TclError):
+            return
+        cname = self.sv_cname()
+        if self.sv_mode == "saves":
+            self.sv_items = list_saves(self.root, cname)
+            for it in self.sv_items:
+                lb.insert("end", f"  {it['file']:<34.34} {fmt_size(it['size']):>9}  "
+                                 f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(it['mtime']))}")
+            if not self.sv_items:
+                lb.insert("end", "  NO SAVES YET. PRESS [INSTALL SAVE].")
+                lb.itemconfig(0, foreground=self.t["dim"])
+        else:
+            self.sv_items = list_backups(self.root, cname)
+            for it in self.sv_items:
+                lb.insert("end", f"  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(it['mtime']))}  "
+                                 f"{it['label']:<11.11} {fmt_size(it['size']):>9}")
+            if not self.sv_items:
+                lb.insert("end", "  NO BACKUPS YET. PRESS [BACKUP NOW].")
+                lb.itemconfig(0, foreground=self.t["dim"])
+        self.sv_buttons()
+
+    def sv_selected(self):
+        try:
+            s = self.sv_lb.curselection()
+            return self.sv_items[s[0]] if s and s[0] < len(self.sv_items) else None
+        except (AttributeError, tk.TclError, IndexError):
+            return None
+
+    def sv_buttons(self):
+        sel = self.sv_selected() is not None
+        for b in getattr(self, "sv_need_sel", []):
+            b.enable(sel)
+        bb = getattr(self, "sv_btn_restore", None)
+        if bb is not None:
+            bb.enable(sel and self.sv_cname() not in self.running and not self.busy)
+
+    # ---- вкладка SAVES: установка сейва без запуска игры
+    def sv_build_saves(self):
+        t, a = self.t, self.sv_area
+        self.label(a, "INSTALL A .msav FILE (OR A .zip WITH SAVES) STRAIGHT INTO THE CONTAINER, NO NEED TO START "
+                      "THE GAME. THE GAME READS THE SAVES FOLDER WHEN IT STARTS.",
+                   dim=True, wraplength=int(680 * self.sc), justify="left", anchor="w").pack(fill="x", pady=(0, 6))
+        tk.Label(a, text=f"  {'FILE':<34} {'SIZE':>9}  MODIFIED", font=self.font, bg=t["bg"], fg=t["dim"],
+                 anchor="w").pack(fill="x")
+        wrap, self.sv_lb = self.listbox(a)
+        wrap.pack(fill="both", expand=True, pady=(2, 8))
+        self.sv_lb.bind("<<ListboxSelect>>", lambda e: self.sv_buttons())
+        row = tk.Frame(a, bg=t["bg"])
+        row.pack(fill="x")
+        self.btn(row, "INSTALL SAVE", self.sv_install, accent=True).pack(side="left", padx=(0, 8))
+        b1 = self.btn(row, "EXPORT", self.sv_export)
+        b2 = self.btn(row, "REMOVE", self.sv_remove)
+        for b in (b1, b2):
+            b.pack(side="left", padx=(0, 8))
+        self.btn(row, "OPEN DIR", lambda: self.safe_open(saves_dir(self.root, self.sv_cname()))).pack(side="left")
+        self.sv_need_sel = [b1, b2]
+        self.sv_btn_restore = None
+        self.sv_refresh()
+
+    def sv_install(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, title="INSTALL SAVES",
+            filetypes=[("Mindustry saves", "*.msav *.zip"), ("all", "*.*")])
+        if not paths:
+            return
+        cname = self.sv_cname()
+        dest = saves_dir(self.root, cname)
+        ok = 0
+        for p in paths:
+            try:
+                for name, good in install_saves(p, dest):
+                    ok += 1
+                    self.log(f"SAVE INSTALLED -> '{cname}': {name}" +
+                             ("" if good else "  (WARNING: NO MSAV HEADER, MAY NOT BE A SAVE)"),
+                             "info" if good else "err")
+            except Exception as e:
+                self.log(f"INSTALL FAILED '{os.path.basename(p)}': {e}", "err")
+        note = "  RESTART THE GAME TO SEE THEM" if cname in self.running else ""
+        self.sv_say(f"INSTALLED {ok} SAVE(S)" + note + ("" if ok else " (SEE CONSOLE)"), not ok)
+        self.sv_refresh()
+
+    def sv_export(self):
+        it = self.sv_selected()
+        if not it:
+            return
+        dst = filedialog.asksaveasfilename(parent=self, title="EXPORT SAVE", initialfile=it["file"],
+                                           defaultextension=".msav", filetypes=[("Mindustry save", "*.msav")])
+        if dst:
+            try:
+                shutil.copy2(it["path"], dst)
+                self.log(f"SAVE EXPORTED: {dst}")
+            except OSError as e:
+                self.log(f"EXPORT FAILED: {e}", "err")
+
+    def sv_remove(self):
+        it = self.sv_selected()
+        if not it:
+            return
+        if self.confirm("REMOVE SAVE", f"DELETE '{it['file']}' FROM '{self.sv_cname()}'?\n\n"
+                                       "(MAKE A BACKUP FIRST IF YOU MAY NEED IT.)", "REMOVE", danger=True):
+            try:
+                os.remove(it["path"])
+                self.log(f"SAVE REMOVED: {it['file']}")
+            except OSError as e:
+                self.log(f"REMOVE FAILED: {e}", "err")
+            self.sv_refresh()
+
+    # ---- вкладка BACKUPS
+    def sv_build_backups(self):
+        t, a = self.t, self.sv_area
+        opt = tk.Frame(a, bg=t["bg"])
+        opt.pack(fill="x", pady=(0, 6))
+        TermToggle(opt, self, "AUTO BACKUP BEFORE EVERY LAUNCH", self.S.get("auto_backup") == "1",
+                   self.sv_set_auto).pack(side="left")
+        self.label(opt, "keep last", dim=True).pack(side="left", padx=(18, 8))
+        self.v_keep = tk.StringVar(value=self.S.get("backup_keep"))
+        self.optmenu(opt, self.v_keep, ["5", "10", "20", "50"], command=self.sv_set_keep).pack(side="left")
+        tk.Label(a, text=f"  {'DATE':<19}  {'TYPE':<11} {'SIZE':>9}", font=self.font, bg=t["bg"], fg=t["dim"],
+                 anchor="w").pack(fill="x")
+        wrap, self.sv_lb = self.listbox(a)
+        wrap.pack(fill="both", expand=True, pady=(2, 8))
+        self.sv_lb.bind("<<ListboxSelect>>", lambda e: self.sv_buttons())
+        row = tk.Frame(a, bg=t["bg"])
+        row.pack(fill="x")
+        self.btn(row, "BACKUP NOW", self.sv_backup_now, accent=True).pack(side="left", padx=(0, 8))
+        self.sv_btn_restore = self.btn(row, "RESTORE", self.sv_restore)
+        b2 = self.btn(row, "DELETE", self.sv_delete_backup)
+        for b in (self.sv_btn_restore, b2):
+            b.pack(side="left", padx=(0, 8))
+        self.btn(row, "OPEN DIR", lambda: self.safe_open(backups_dir(self.root, self.sv_cname()))).pack(side="left")
+        self.sv_need_sel = [b2]
+        self.sv_refresh()
+
+    def sv_set_auto(self, v):
+        self.S.set("auto_backup", "1" if v else "0")
+        self.S.save()
+        self.log("AUTO BACKUP " + ("ON" if v else "OFF"))
+
+    def sv_set_keep(self, v):
+        self.S.set("backup_keep", v)
+        self.S.save()
+
+    def sv_backup_now(self):
+        if self.busy:
+            self.sv_say("BUSY, TRY AGAIN IN A MOMENT", True)
+            return
+        cname, root = self.sv_cname(), self.root
+        self.busy = True
+        self.update_state()
+        self.sv_say("BACKING UP ...")
+
+        def work():
+            try:
+                path, n = make_backup(root, cname, "manual")
+                self.ui(self._backup_done, cname, path, n, None)
+            except Exception as e:
+                self.ui(self._backup_done, cname, None, 0, e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _backup_done(self, cname, path, n, err):
+        self.busy = False
+        self.update_state()
+        if err:
+            self.log(f"[{cname}] BACKUP FAILED: {err}", "err")
+            self.sv_say("BACKUP FAILED (SEE CONSOLE)", True)
+        elif not path:
+            self.sv_say("NOTHING TO BACK UP: THE CONTAINER HAS NO DATA YET", True)
+        else:
+            self.log(f"[{cname}] BACKUP {os.path.basename(path)} ({n} FILES, {fmt_size(os.path.getsize(path))})")
+            self.sv_say(f"BACKUP DONE: {os.path.basename(path)}")
+        self.refresh_saves_page()
+
+    def sv_restore(self):
+        it = self.sv_selected()
+        cname = self.sv_cname()
+        if not it or cname in self.running or self.busy:
+            return
+        if not self.confirm("RESTORE BACKUP",
+                            f"RESTORE '{it['file']}' INTO '{cname}'?\n\n"
+                            "THE CURRENT DATA IS REPLACED (SAVES, MAPS, MODS, SETTINGS).\n"
+                            "A BACKUP OF THE CURRENT STATE IS MADE FIRST.", "RESTORE", danger=True):
+            return
+        root = self.root
+        self.busy = True
+        self.update_state()
+        self.sv_say("RESTORING ...")
+
+        def work():
+            try:
+                make_backup(root, cname, "prerestore")
+                restore_backup(root, cname, it["path"])
+                self.ui(self._restore_done, cname, it["file"], None)
+            except Exception as e:
+                self.ui(self._restore_done, cname, it["file"], e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _restore_done(self, cname, fn, err):
+        self.busy = False
+        self.update_state()
+        if err:
+            self.log(f"[{cname}] RESTORE FAILED: {err}", "err")
+            self.sv_say("RESTORE FAILED (SEE CONSOLE)", True)
+        else:
+            self.log(f"[{cname}] RESTORED FROM {fn}")
+            self.sv_say(f"RESTORED FROM {fn}")
+        self.refresh_saves_page()
+
+    def sv_delete_backup(self):
+        it = self.sv_selected()
+        if not it:
+            return
+        if self.confirm("DELETE BACKUP", f"DELETE '{it['file']}'?", "DELETE", danger=True):
+            try:
+                os.remove(it["path"])
+                self.log(f"BACKUP DELETED: {it['file']}")
+            except OSError as e:
+                self.log(f"DELETE FAILED: {e}", "err")
+            self.sv_refresh()
+
+    # ----------------------------------------------------------- страница: мониторинг процесса
+    def _tick_mon(self):
+        now = time.time()
+        for name, p in list(self.running.items()):
+            m = self.mon.get(name)
+            if not m:
+                continue
+            smp = proc_sample(p.pid)
+            if smp is None:
+                continue
+            cpu_s, rss = smp
+            pct = 0.0
+            if m["last"]:
+                dw = now - m["last"][0]
+                if dw > 0:
+                    pct = max(0.0, (cpu_s - m["last"][1]) / dw / self.ncpu * 100.0)
+            m["last"] = (now, cpu_s)
+            m["hist"].append((now, pct, rss))
+            del m["hist"][:-150]
+            m["peak_rss"] = max(m["peak_rss"], rss)
+            m["peak_cpu"] = max(m["peak_cpu"], pct)
+            m["cpu_s"] = cpu_s
+        if self.page == "monitor":
+            self.mon_refresh()
+        self.after(2000, self._tick_mon)
+
+    def page_monitor(self):
+        t = self.t
+        outer, body = self.panel(self.content, "MONITOR.SYS")
+        outer.pack(fill="both", expand=True)
+        tk.Label(body, text=self.m_row("NAME", "PID", "UPTIME", "CPU", "RAM", "XMX"), font=self.font,
+                 bg=t["bg"], fg=t["dim"], anchor="w").pack(fill="x")
+        wrap, self.m_lb = self.listbox(body)
+        wrap.config(height=int(86 * self.sc))
+        wrap.pack_propagate(False)
+        wrap.pack(fill="x", pady=(2, 8))
+        self.m_lb.bind("<<ListboxSelect>>", lambda e: self.mon_refresh(keep_sel=True))
+        self.m_names = []
+        self.m_info = self.label(body, "", dim=True, anchor="w", justify="left")
+        self.m_info.pack(fill="x", pady=(0, 6))
+        gf = tk.Frame(body, bg=t["bg"])
+        gf.pack(fill="both", expand=True)
+        gf.columnconfigure(0, weight=1, uniform="g")
+        gf.columnconfigure(1, weight=1, uniform="g")
+        gf.rowconfigure(0, weight=1)
+        self.g_cpu = tk.Canvas(gf, bg=t["panel"], highlightthickness=1, highlightbackground=t["dim"], height=int(110 * self.sc))
+        self.g_ram = tk.Canvas(gf, bg=t["panel"], highlightthickness=1, highlightbackground=t["dim"], height=int(110 * self.sc))
+        self.g_cpu.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        self.g_ram.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        for c in (self.g_cpu, self.g_ram):
+            c.bind("<Configure>", lambda e: self.mon_graphs())
+        row = tk.Frame(body, bg=t["bg"])
+        row.pack(fill="x", pady=(8, 0))
+        self.mb_stop = self.btn(row, "STOP", self.mon_stop, accent=True)
+        self.mb_open = self.btn(row, "OPEN DIR", self.mon_open)
+        self.mb_stop.pack(side="left", padx=(0, 8))
+        self.mb_open.pack(side="left")
+        self.mon_refresh()
+
+    @staticmethod
+    def m_row(a, b, c, d, e, f):
+        return f"  {a:<15.15} {b:<7} {c:<9} {d:<7} {e:<9} {f}"
+
+    def mon_sel(self):
+        try:
+            s = self.m_lb.curselection()
+            return self.m_names[s[0]] if s and s[0] < len(self.m_names) else None
+        except (AttributeError, tk.TclError):
+            return None
+
+    def mon_refresh(self, keep_sel=False):
+        if self.page != "monitor":
+            return
+        try:
+            lb = self.m_lb
+        except AttributeError:
+            return
+        sel = self.mon_sel()
+        names = [n for n in self.running if n in self.mon]
+        if not keep_sel:
+            lb.delete(0, "end")
+            self.m_names = names
+            now = time.time()
+            for n in names:
+                m, h = self.mon[n], self.mon[n]["hist"]
+                cpu = f"{h[-1][1]:.0f}%" if h else "..."
+                ram = fmt_bytes(h[-1][2]) if h else "..."
+                lb.insert("end", self.m_row(n, self.running[n].pid, fmt_clock(now - m["start"]), cpu, ram,
+                                            fmt_ram(m["xmx"])))
+            if not names:
+                lb.insert("end", "  NO RUNNING CONTAINERS. START ONE IN CONTAINERS.RSU.")
+                lb.itemconfig(0, foreground=self.t["dim"])
+            if names:
+                lb.selection_set(names.index(sel) if sel in names else 0)
+        cur = self.mon_sel()
+        self.mb_stop.enable(bool(cur))
+        self.mb_open.enable(bool(cur))
+        if cur and cur in self.mon:
+            m = self.mon[cur]
+            h = m["hist"]
+            now_rss = h[-1][2] if h else 0
+            used = f"{now_rss / 1048576 / m['xmx'] * 100:.0f}% OF XMX" if now_rss and m["xmx"] else ""
+            self.m_info.config(
+                text=f"{cur}   PID {self.running[cur].pid}   CPU TIME {fmt_clock(m.get('cpu_s', 0))}   "
+                     f"PEAK RAM {fmt_bytes(m['peak_rss'])}   PEAK CPU {m['peak_cpu']:.0f}%   {used}"
+                     + ("" if h else "   (NO DATA: CANNOT READ THE PROCESS)"))
+        else:
+            self.m_info.config(text="")
+        self.mon_graphs()
+
+    def mon_graphs(self):
+        cur = self.mon_sel()
+        m = self.mon.get(cur) if cur else None
+        h = m["hist"] if m else []
+        self.draw_graph(self.g_cpu, [x[1] for x in h], 100.0, "CPU %", f"{h[-1][1]:.0f}%" if h else "")
+        peak = max([x[2] for x in h] + [1]) / 1048576
+        xmx = m["xmx"] if m else 0
+        self.draw_graph(self.g_ram, [x[2] / 1048576 for x in h], max(peak * 1.15, xmx * 1.1, 64.0),
+                        f"RAM MB  (RED LINE = XMX {fmt_ram(xmx)})" if xmx else "RAM MB",
+                        fmt_bytes(h[-1][2]) if h else "", mark=xmx)
+
+    def draw_graph(self, cv, vals, ymax, title, now, mark=None):
+        try:
+            cv.delete("all")
+            w, hgt = cv.winfo_width(), cv.winfo_height()
+        except tk.TclError:
+            return
+        if w < 40 or hgt < 40:
+            return
+        t = self.t
+        l, r, tp, b = 8, w - 8, 22, hgt - 8
+        cv.create_text(l, 4, text=title, anchor="nw", fill=t["dim"], font=self.font_s)
+        cv.create_text(r, 4, text=now, anchor="ne", fill=t["acc"], font=self.font_b)
+        for f in (0.0, 0.5, 1.0):
+            y = b - (b - tp) * f
+            cv.create_line(l, y, r, y, fill=t["dim"], dash=(2, 4))
+        if mark and mark <= ymax:
+            y = b - (b - tp) * mark / ymax
+            cv.create_line(l, y, r, y, fill=t["acc"])
+        if len(vals) < 2:
+            return
+        step = (r - l) / 149.0
+        pts = []
+        for i, v in enumerate(vals):
+            x = r - (len(vals) - 1 - i) * step
+            y = b - (b - tp) * min(max(v / ymax, 0.0), 1.0)
+            pts += [x, y]
+        cv.create_line(*pts, fill=t["fg"], width=2)
+
+    def mon_stop(self):
+        n = self.mon_sel()
+        if n and n in self.running:
+            try:
+                self.running[n].terminate()
+                self.log(f"[{n}] TERMINATE SENT")
+            except Exception as e:
+                self.log(f"STOP FAILED: {e}", "err")
+
+    def mon_open(self):
+        n = self.mon_sel()
+        if n:
+            self.safe_open(container_dir(self.root, n))
+
     # ----------------------------------------------------------- страница: настройки
     def page_settings(self):
         t = self.t
@@ -1372,7 +2961,7 @@ class App(tk.Tk):
             return f
 
         section("launcher")
-        row("install_dir", self.entry(g, self.v_dir, 40, readonly=True),
+        row("install_dir", self.entry(g, self.v_dir, 24, readonly=True),
             btns(("BROWSE", self.change_root), ("OPEN", lambda: self.safe_open(self.root))))
         tf = tk.Frame(g, bg=t["bg"])
         for name, th in THEMES.items():
@@ -1382,16 +2971,22 @@ class App(tk.Tk):
                 b.activate()
         row("theme", tf)
         section("java")
-        row("java_path", self.entry(g, self.v_java, 40),
+        row("java_path", self.entry(g, self.v_java, 24),
             btns(("BROWSE", self.pick_java), ("AUTO", lambda: self.v_java.set(""))))
         self.lbl_java = self.label(g, self.java_info, dim=True, anchor="w")
         row("java_found", self.lbl_java)
         row("ram_min", self.entry(g, self.v_rmin, 12), hint="e.g. 256M, 1G")
         row("ram_max", self.entry(g, self.v_rmax, 12), hint="e.g. 2G, 4096M")
-        row("jvm_args", self.entry(g, self.v_jvm, 40), hint="")
-        row("game_args", self.entry(g, self.v_game, 40), hint="")
-        self.label(g, "global args are applied to every container; container args go after them.",
-                   dim=True).grid(row=r[0], column=0, columnspan=3, sticky="w", pady=(4, 0))
+        row("jvm_args", self.entry(g, self.v_jvm, 24), hint="")
+        row("game_args", self.entry(g, self.v_game, 24), hint="")
+        self.label(g, "global args apply to every container; container args go after them.",
+                   dim=True, wraplength=int(600 * self.sc), justify="left").grid(row=r[0], column=0, columnspan=3, sticky="w", pady=(4, 0))
+        r[0] += 1
+        section("steam")
+        self.v_suser = tk.StringVar(value=self.S.get("steam_user"))
+        row("steam_user", self.entry(g, self.v_suser, 24), btns(("LOGIN", self.steam_login)))
+        self.label(g, "needed for Workshop: your Steam account with a purchased copy of Mindustry (password goes only into the steamcmd window)",
+                   dim=True, wraplength=int(600 * self.sc), justify="left").grid(row=r[0], column=0, columnspan=3, sticky="w", pady=(2, 0))
         r[0] += 1
         bar = tk.Frame(body, bg=t["bg"])
         bar.pack(fill="x", pady=(16, 0), anchor="n")
@@ -1399,6 +2994,36 @@ class App(tk.Tk):
         self.btn(bar, "RESET", lambda: self.show_page("settings")).pack(side="left", padx=(0, 12))
         self.set_msg = self.label(bar, "", accent=True)
         self.set_msg.pack(side="left")
+
+    def steam_login(self):
+        """Открывает окно steamcmd, где пользователь сам вводит пароль и код Steam Guard.
+        Лаунчер пароль не видит; steamcmd запоминает вход и дальше качает от имени аккаунта."""
+        user = self.v_suser.get().strip()
+        if not user or " " in user:
+            self.set_msg.config(text="! ENTER YOUR STEAM LOGIN NAME FIRST")
+            return
+        self.S.set("steam_user", user)
+        self.S.save()
+        sdir = self.ws_dir()
+        self.log("PREPARING STEAMCMD LOGIN ...")
+
+        def log(m, lvl="info"):
+            self.ui(self.log, m, lvl)
+
+        def work():
+            try:
+                exe = ensure_steamcmd(sdir, log)
+                if IS_WIN:
+                    subprocess.Popen([exe, "+login", user], cwd=os.path.dirname(exe),
+                                     creationflags=0x10)  # CREATE_NEW_CONSOLE
+                    log("STEAMCMD WINDOW OPENED. ENTER PASSWORD AND STEAM GUARD CODE THERE, "
+                        "WAIT FOR 'Waiting for user info...OK', THEN TYPE quit")
+                else:
+                    log(f"RUN IN A TERMINAL: {exe} +login {user}   (THEN TYPE quit)")
+            except Exception as e:
+                log(f"STEAM LOGIN FAILED: {e}", "err")
+
+        threading.Thread(target=work, daemon=True).start()
 
     def safe_open(self, path):
         try:
@@ -1438,6 +3063,7 @@ class App(tk.Tk):
         self.S.set("java_path", jp)
         self.S.set("jvm_args", self.v_jvm.get().strip())
         self.S.set("game_args", self.v_game.get().strip())
+        self.S.set("steam_user", self.v_suser.get().strip())
         self.S.save()
         self.v_rmin.set(fmt_ram(mn))
         self.v_rmax.set(fmt_ram(mx))
